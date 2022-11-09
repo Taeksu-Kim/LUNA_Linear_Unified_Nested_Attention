@@ -1,6 +1,8 @@
 # LUNA_Linear_Unified_Nested_Attention
+현재 인코더까지만 구현 디코더는 구현 후 업데이트 예정
 
-코드는 정리후 올릴 예정
+## Usage
+luna_encoder_exmaple.ipynb 참고
 
 ## Paper
 https://arxiv.org/pdf/2106.01540v2.pdf

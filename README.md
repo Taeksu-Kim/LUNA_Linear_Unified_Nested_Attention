@@ -2,7 +2,8 @@
 디코더까지 구현 완료, 파라미터 수가 공식 구현에 비해 더 많은 것으로 보이므로 이와 관련하여 확인 작업 예정
 
 ## Usage
-luna_encoder_exmaple.ipynb 참고
+luna_model_exmaple.ipynb 참고(encoder-decoder)   
+luna_encoder_exmaple.ipynb 참고(encoder)
 
 ## Paper
 https://arxiv.org/pdf/2106.01540v2.pdf

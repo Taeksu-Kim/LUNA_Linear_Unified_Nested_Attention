@@ -11,5 +11,6 @@
     "num_att_heads": 4,
     "feed_forward_dim": 1024,
     "project_embedding_length": 32,
-    "p_drop_out_raito": 0.3
+    "p_drop_out_raito": 0.3,
+    "dynamic_projection": true,
 }

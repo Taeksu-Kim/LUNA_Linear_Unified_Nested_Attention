@@ -76,7 +76,6 @@ class MultiHeadAttention(nn.Module):
         self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
 
         self.scaled_dot_attn = ScaledDotProductAttention(config, self.d_head)
-        self.linear = nn.Linear(self.d_head * self.num_att_heads, self.d_model)
 
     def forward(self, query, key, value, attn_mask=None):
         batch_size = query.size(0)
@@ -92,9 +91,7 @@ class MultiHeadAttention(nn.Module):
 
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.num_att_heads * self.d_head)
         
-        output = self.linear(context)
-        
-        return output, attn_prob
+        return context, attn_prob
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, config, d_head):
@@ -122,6 +119,14 @@ class LinearUnifiedNestedAttention(nn.Module):
         self.pack_attention = MultiHeadAttention(config)
         self.unpack_attention = MultiHeadAttention(config)
 
+        self.d_model = config.d_model
+        self.num_att_heads = config.num_att_heads
+        assert self.d_model % self.num_att_heads == 0, "d_model({}) % num_att_heads({}) = {}. It should be 0.".format(self.d_model, self.num_att_heads, self.d_model % self.num_att_heads)
+        
+        self.d_head = int(self.d_model / self.num_att_heads)
+
+        self.linear = nn.Linear(self.d_head * self.num_att_heads, self.d_model)
+
     def forward(
             self,
             query: torch.FloatTensor,
@@ -139,6 +144,9 @@ class LinearUnifiedNestedAttention(nn.Module):
                                       key=Yp, 
                                       value=Yp, 
                                       attn_mask=p_mask)
+
+        Yx = self.linear(Yx)
+
         return Yp, Yx
 
 class LunaTransformerEncoderLayer(nn.Module):

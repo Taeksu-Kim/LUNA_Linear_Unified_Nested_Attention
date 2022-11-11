@@ -418,3 +418,51 @@ class LunaCausalAttention(nn.Module):
         attn = attn.transpose(0, 1)
 
         return attn
+    
+class Luna_Transformer(nn.Module):
+    def __init__(self, config):
+        super(Luna_Transformer, self).__init__()
+        self.config = config
+        self.encoder = Luna_TransformerEncoder(config)
+        if config.use_decoder == True:
+            self.decoder = Luna_TransformerDecoder(config)
+        
+        self.init_weights()
+
+    def init_weights(self):
+        # Initialize weights for each layer
+        self.apply(self.init_layer_weights)
+
+    # ref huggingface
+    # https://huggingface.co/transformers/v4.9.2/_modules/transformers/models/electra/modeling_electra.html#ElectraPreTrainedModel
+    def init_layer_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+            module.eps = self.config.norm_eps
+
+    def forward(self, 
+                enc_inputs, 
+                dec_inputs=None, 
+                enc_self_attn_mask=None):
+      
+        enc_outputs, enc_p, enc_input_mask, enc_p_mask = self.encoder(enc_inputs, enc_self_attn_mask)
+        
+        if self.config.use_decoder == False:
+            return  enc_outputs, enc_p
+        
+        dec_outputs = self.decoder(dec_inputs,
+                                   enc_outputs,
+                                   enc_p,
+                                   enc_input_mask=enc_input_mask, 
+                                   p_mask=enc_p_mask)
+
+        return dec_outputs

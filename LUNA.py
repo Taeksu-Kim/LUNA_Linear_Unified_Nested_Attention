@@ -22,8 +22,8 @@ def PositionalEncoding(max_seq_len, d_model):
     
     return pe
 
-def get_attn_pad_mask(key_inputs, pad_id, query_len):                   # self_attention : [bs, query_len, query_len]
-    return key_inputs.eq(pad_id).unsqueeze(1).expand(-1, query_len, -1) # cross_attention : [bs, query_len, key_len]
+def get_attn_pad_mask(key_inputs, pad_id):                  
+    return key_inputs.eq(pad_id)
 
 class PoswiseFeedForward(nn.Module):
     def __init__(self, config):
@@ -37,6 +37,30 @@ class PoswiseFeedForward(nn.Module):
 
     def forward(self, inputs):
         return self.feed_forward(inputs)
+
+def efficient_causal_attention_seq(x, y, z):
+    """
+    efficient causal attention operation
+    Args:
+        x (Tensor): Tensor with shape `(batch, n, d1)`
+        y (Tensor): Tensor with shape `(batch, n, d1)`
+        z (Tensor): Tensor with shape '(batch, n, d2)`
+    return:
+    """
+    n = x.size(1)
+    rets = []
+    accum_mat = 0
+    for i in range(n):
+        xx = x[:, i:i + 1] # B x 1 x d1
+        yy = y[:, i:i + 1] # B x 1 x d1
+        zz = z[:, i:i + 1] # B x 1 x d2
+
+        # B x d1 x d2
+        accum_mat = accum_mat + torch.bmm(yy.transpose(1, 2), zz)
+        # B x 1 x d2
+        rets.append(torch.bmm(xx, accum_mat).div(i + 1.))
+    # B x N x d2
+    return torch.cat(rets, dim=1)
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
@@ -62,7 +86,7 @@ class MultiHeadAttention(nn.Module):
         value = self.value_proj(value).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, value_len, d_head]
 
         if attn_mask is not None:
-          attn_mask = attn_mask.unsqueeze(1).repeat(1, self.num_att_heads, 1, 1) # [bs, query_len, key_len] -> [bs, num_heads, query_len, key_len]
+          attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) # [bs, key_len] -> [bs, 1, 1, key_len]
 
         context, attn_prob = self.scaled_dot_attn(query, key, value, attn_mask)
 
@@ -104,16 +128,17 @@ class LinearUnifiedNestedAttention(nn.Module):
             key: torch.FloatTensor,
             value: torch.FloatTensor,
             p: torch.FloatTensor,
-            attention_padding_mask: torch.BoolTensor = None,
+            input_mask: torch.BoolTensor = None,
+            p_mask : torch.BoolTensor = None,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         Yp, _ = self.pack_attention(query=p, 
                                     key=key, 
                                     value=value, 
-                                    attn_mask=attention_padding_mask)
+                                    attn_mask=input_mask)
         Yx, _ = self.unpack_attention(query=query, 
                                       key=Yp, 
                                       value=Yp, 
-                                      attn_mask=None)
+                                      attn_mask=p_mask)
         return Yp, Yx
 
 class LunaTransformerEncoderLayer(nn.Module):
@@ -128,8 +153,8 @@ class LunaTransformerEncoderLayer(nn.Module):
         self.feed_forward_layer_norm = nn.LayerNorm(config.d_model)
 
 
-    def forward(self, inputs, p, padding_mask):
-        Yp, Yx   = self.luna_self_attention(inputs, inputs, inputs, p, padding_mask)
+    def forward(self, inputs, p, input_mask, p_mask):
+        Yp, Yx   = self.luna_self_attention(inputs, inputs, inputs, p, input_mask, p_mask)
         Yp = self.Yp_layer_norm(Yp + p)
         Yx = self.Yx_layer_norm(Yx + inputs)
         outputs = self.feed_forward(Yx)
@@ -143,29 +168,37 @@ class Luna_TransformerEncoder(nn.Module):
         self.config = config
         self.sqrt_dim = math.sqrt(config.d_model)
         self.dropout = nn.Dropout(p=config.drop_out_raito)
+        self.dynamic_projection = config.dynamic_projection
 
         self.word_embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.pad_id)
         self.pos_encoding = PositionalEncoding(config.max_enc_len, config.d_model)
 
-        self.projected_embedding_length = config.project_embedding_length
+        self.projected_embedding_length = config.p_length
         self.projected_embeddings = nn.Parameter(torch.Tensor(self.projected_embedding_length, config.d_model))
         nn.init.normal_(self.projected_embeddings, mean=0.0, std=config.d_model ** -0.5)
         self.projected_position_embeddings = PositionalEncoding(self.projected_embedding_length, config.d_model)
 
         self.layers = nn.ModuleList([LunaTransformerEncoderLayer(config) for _ in range(config.num_enc_layers)])
 
-    def forward(self, enc_inputs, padding_mask=None):
+    def forward(self, inputs, input_mask=None, input_lengths=None):
 
-        outputs = self.word_embedding(enc_inputs) * self.sqrt_dim + self.pos_encoding.to(enc_inputs.device)
+        outputs = self.word_embedding(inputs) * self.sqrt_dim + self.pos_encoding.to(inputs.device)
         
-        projected_embedded = self.projected_embeddings * self.sqrt_dim + self.projected_position_embeddings[0].to(enc_inputs.device)
+        projected_embedded = self.projected_embeddings * self.sqrt_dim + self.projected_position_embeddings[0].to(inputs.device)
         projected_embedded = projected_embedded.expand((outputs.shape[0],) + projected_embedded.size())
 
-        if padding_mask == None:
-            padding_mask = get_attn_pad_mask(enc_inputs, self.config.pad_id, self.projected_embedding_length)
-            
+        if input_mask is None:
+            input_mask = get_attn_pad_mask(inputs, self.config.pad_id)
+
+        if self.dynamic_projection:
+            if input_lengths is None:
+              input_lengths = torch.sum(inputs.ne(self.config.pad_id), dim=-1)
+
+            pidx = torch.arange(self.config.p_length).unsqueeze(0).to(projected_embedded.device)
+            p_mask = pidx.ge(input_lengths.unsqueeze(1))
         else:
-            padding_mask = get_attn_pad_mask(padding_mask, 0, self.projected_embedding_length)
+            p_mask = None
+            
 
         outputs = self.dropout(outputs)
         projected_embedded = self.dropout(projected_embedded)
@@ -173,23 +206,215 @@ class Luna_TransformerEncoder(nn.Module):
         for layer in self.layers:
             outputs, projected_embedded = layer(inputs=outputs, 
                                                 p=projected_embedded,
-                                                padding_mask=padding_mask)
+                                                input_mask=input_mask,
+                                                p_mask=p_mask)
         
-        return outputs, projected_embedded
+        return outputs, projected_embedded, input_mask, p_mask
+
+class Luna_TransformerDecoder(nn.Module):
+    def __init__(self, config):
+        super(Luna_TransformerDecoder, self).__init__()
+        self.config = config
+        self.sqrt_dim = math.sqrt(config.d_model)
+        self.p_dropout = nn.Dropout(p=config.drop_out_raito)
+
+        self.word_embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=config.pad_id)
+        self.pos_encoding = PositionalEncoding(config.max_dec_len, config.d_model)
+
+        if config.decoder_only is True:
+          self.projected_embedding_length = config.p_length
+          self.projected_embeddings = nn.Parameter(torch.Tensor(self.projected_embedding_length, config.d_model))
+          nn.init.normal_(self.projected_embeddings, mean=0.0, std=config.d_model ** -0.5)
+          self.projected_position_embeddings = PositionalEncoding(self.projected_embedding_length, config.d_model)
+
+        self.layers = nn.ModuleList([LunaTransformerDecoderLayer(config) for _ in range(config.num_dec_layers)])
+
+        self.fc = nn.Linear(config.d_model, config.vocab_size)
+
+    def decoder_step(self,
+                     dec_inputs,
+                     enc_outputs,
+                     p,
+                     enc_input_mask=None, 
+                     p_mask=None):
+
+        dec_outputs = self.word_embedding(dec_inputs) * self.sqrt_dim + self.pos_encoding[:, :dec_inputs.size(1)].to(dec_inputs.device)
+
+        if p is None:
+            p = self.projected_embeddings * self.sqrt_dim + self.projected_position_embeddings[0].to(enc_inputs.device)
+            p = p.expand((outputs.shape[0],) + p.size())
+            if self.dynamic_projection:
+              if input_lengths is None:
+                input_lengths = torch.sum(inputs.ne(self.config.pad_id), dim=-1)
+                pidx = torch.arange(self.config.p_length).unsqueeze(0).to(p.device)
+                p_mask = pidx.ge(input_lengths.unsqueeze(1))
+              
+        dec_input_mask = get_attn_pad_mask(dec_inputs, self.config.pad_id)
+
+        for layer in self.layers:
+            dec_outputs, p = layer(dec_outputs, p,
+                                   enc_outputs, 
+                                   dec_input_mask, 
+                                   p_mask,
+                                   enc_input_mask)
+
+        return dec_outputs, p
+
+    def forward(self,
+                dec_inputs,
+                enc_outputs,
+                p=None,
+                enc_input_mask=None,
+                p_mask=None):
+       
+
+        if dec_inputs is not None:
+            dec_outputs, p = self.decoder_step(dec_inputs=dec_inputs,
+                                               enc_outputs=enc_outputs,
+                                               p=p,
+                                               enc_input_mask=enc_input_mask, 
+                                               p_mask=p_mask)
+            
+            dec_outputs = self.fc(dec_outputs)
 
 
+        else:
+            dec_inputs = torch.zeros([enc_outputs.size(0), self.config.max_dec_len], device=enc_outputs.device).long()
+            dec_inputs = dec_inputs.fill_(self.config.pad_id)
+            dec_inputs[:, 0] = self.config.bos_id
+
+            dec_outputs = []
+            for dec_idx in range(1, self.config.max_dec_len):
+                dec_output, p = self.decoder_step(dec_inputs=dec_inputs[:, :dec_idx],
+                                                   enc_outputs=enc_outputs,
+                                                   p=p,
+                                                   enc_input_mask=enc_input_mask, 
+                                                   p_mask=p_mask)
+                dec_output = self.fc(dec_output)                
+                dec_outputs.append(dec_output[:, -1, :])                
+                dec_inputs[:, dec_idx] = dec_outputs[-1].argmax(dim=-1)
+                
+            dec_outputs = torch.stack(dec_outputs, dim=1)
 
 
+        return dec_outputs
+
+class LunaTransformerDecoderLayer(nn.Module):
+    def __init__(self, config):
+        super(LunaTransformerDecoderLayer, self).__init__()
+        
+        self.feed_forward = PoswiseFeedForward(config)
+
+        self.luna_dec_self_attention = LunaCausalAttention(config)
+        self.cross_attention = LinearUnifiedNestedAttention(config)
+        
+        
+        self.feed_forward = PoswiseFeedForward(config)
+        self.Yp_layer_norm = nn.LayerNorm(config.d_model)
+        self.Yx_layer_norm = nn.LayerNorm(config.d_model)
+        self.feed_forward_layer_norm = nn.LayerNorm(config.d_model)
 
 
+    def forward(self,
+                dec_outputs, 
+                p,
+                enc_outputs, 
+                dec_input_mask, 
+                p_mask,
+                enc_input_mask,
+                ):
+
+        self_att_outputs  = self.luna_dec_self_attention(dec_outputs,
+                                                         p,
+                                                         dec_input_mask,
+                                                         p_mask)
+        
+        dec_outputs = self_att_outputs + dec_outputs
+
+        Yp, Yx   = self.cross_attention(dec_outputs, enc_outputs, enc_outputs, p, enc_input_mask, p_mask)
+
+        Yp = self.Yp_layer_norm(Yp + p)
+        Yx = self.Yx_layer_norm(Yx + dec_outputs)
+        outputs = self.feed_forward(Yx)
+        outputs = self.feed_forward_layer_norm(outputs + Yx)
+                                      
+        return outputs, Yp
+
+class LunaCausalAttention(nn.Module):
+    def __init__(self, config):
+        super(LunaCausalAttention, self).__init__()
+
+        self.d_model = config.d_model
+        self.num_att_heads = config.num_att_heads= config.num_att_heads
+        self.d_head = int(self.d_model / self.num_att_heads)
+        self.scale = self.d_head ** 0.5
+
+        self.query_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        
+        self.p_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.pc_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+
+        self.out_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
 
 
+        self.pack_attention = MultiHeadAttention(config)
+        self.unpack_attention = MultiHeadAttention(config)
 
+    def forward(
+            self,
+            query,
+            p,
+            dec_input_mask,
+            p_mask,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
 
+        query = query.transpose(0,1).contiguous()
+        p = p.transpose(0,1).contiguous()
 
+        dec_input_len, batch_size, embed_dim = query.size()
 
+        p_len = p.shape[0]
 
+        pq = self.p_proj(p).view(p_len, batch_size, self.num_att_heads, self.d_head)
+        pq = pq.permute(1, 2, 0, 3)
 
+        p_context = self.pc_proj(query)
+        p_context = p_context.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
 
+        pq = pq.view(batch_size * self.num_att_heads, -1, self.d_head).transpose(1, 2)
 
+        pattn_weights = p_context.bmm(pq)
+        pattn_weights = nn.functional.softplus(pattn_weights, beta=math.log(2.0))
+        # 드랍아웃?
 
+        q = self.query_proj(query)
+        q = q.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+
+        k = self.key_proj(query)
+        k = k.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+
+        v = self.value_proj(query)
+        v = v.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+    
+        attn_weights = efficient_causal_attention_seq(q, k, pattn_weights)
+
+        assert list(attn_weights.size()) == [batch_size * self.num_att_heads, dec_input_len, p_len]
+
+        if p_mask is not None:
+            attn_weights = attn_weights.view(batch_size, self.num_att_heads, dec_input_len, p_len)
+            attn_weights = attn_weights.masked_fill(p_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), 1e-9)
+            attn_weights = attn_weights.view(batch_size * self.num_att_heads, dec_input_len, p_len)
+
+        attn_probs_float = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = attn_probs_float.type_as(attn_weights)
+        # 드랍아웃
+
+        attn = efficient_causal_attention_seq(attn_probs, pattn_weights, v)
+
+        attn = attn.transpose(0, 1).contiguous().view(dec_input_len, batch_size, embed_dim)
+        attn = self.out_proj(attn)
+        attn = attn.transpose(0, 1)
+
+        return attn

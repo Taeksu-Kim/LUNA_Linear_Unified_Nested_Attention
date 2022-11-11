@@ -1,0 +1,19 @@
+{
+    "vocab_size": 200,
+    "d_model": 256,
+    "max_enc_len": 128,
+    "max_dec_len": 64,
+    "pad_id": 0,
+    "use_decoder": true,
+    "init_std": 0.02,
+    "norm_eps": 1e-12,
+    "drop_out_raito": 0.1,
+    "num_enc_layers": 3,
+    "num_dec_layers": 3,
+    "num_att_heads": 4,
+    "feed_forward_dim": 1024,
+    "p_length": 32,
+    "p_drop_out_raito": 0.3,
+    "decoder_only": false,
+    "dynamic_projection": true
+}

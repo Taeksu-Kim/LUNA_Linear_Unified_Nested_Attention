@@ -72,8 +72,13 @@ class MultiHeadAttention(nn.Module):
         self.d_head = int(self.d_model / self.num_att_heads)
         
         self.query_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+
+        if config.tie_key_value is True:
+            self.key_value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        else:
+            self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.key_value_proj = None
 
         self.scaled_dot_attn = ScaledDotProductAttention(config, self.d_head)
 
@@ -81,11 +86,16 @@ class MultiHeadAttention(nn.Module):
         batch_size = query.size(0)
 
         query = self.query_proj(query).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, query_len, d_head]
-        key = self.key_proj(key).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, key_len, d_head]
-        value = self.value_proj(value).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, value_len, d_head]
+        
+        if self.key_value_proj is None:
+            key = self.key_proj(key).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, key_len, d_head]
+            value = self.value_proj(value).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, value_len, d_head]
+
+        else:
+            key = value = self.key_value_proj(key).view(batch_size, -1, self.num_att_heads, self.d_head).transpose(1,2) # [bs, num_heads, query_len, d_head] 
 
         if attn_mask is not None:
-          attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) # [bs, key_len] -> [bs, 1, 1, key_len]
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) # [bs, key_len] -> [bs, 1, 1, key_len]
 
         context, attn_prob = self.scaled_dot_attn(query, key, value, attn_mask)
 

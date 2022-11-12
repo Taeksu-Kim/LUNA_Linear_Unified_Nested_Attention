@@ -12,5 +12,6 @@
     "feed_forward_dim": 1024,
     "p_length": 32,
     "p_drop_out_raito": 0.3,
-    "dynamic_projection": true
+    "dynamic_projection": true,
+    "tie_key_value":false,
 }

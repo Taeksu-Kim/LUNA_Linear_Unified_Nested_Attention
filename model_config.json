@@ -16,4 +16,5 @@
     "p_drop_out_raito": 0.3,
     "decoder_only": false,
     "dynamic_projection": true
+    "tie_key_value": false
 }

@@ -107,11 +107,13 @@ class ScaledDotProductAttention(nn.Module):
     def __init__(self, config, d_head):
         super(ScaledDotProductAttention, self).__init__()
         self.config = config
-        self.scale = d_head ** 0.5
+        self.scale = d_head ** -0.5
+        
 
     def forward(self, query, key, value, attn_mask=None):
-
-        scores = torch.matmul(query, key.transpose(-2, -1)) / self.scale # [bs, num_heads, query_len, key_len]
+      
+        query = query * self.scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) # [bs, num_heads, query_len, key_len]
         
         if attn_mask is not None:
           scores.masked_fill_(attn_mask, -1e4)
@@ -321,15 +323,13 @@ class LunaTransformerDecoderLayer(nn.Module):
     def __init__(self, config):
         super(LunaTransformerDecoderLayer, self).__init__()
         
-        self.feed_forward = PoswiseFeedForward(config)
-
         self.luna_dec_self_attention = LunaCausalAttention(config)
         self.cross_attention = LinearUnifiedNestedAttention(config)
         
-        
-        self.feed_forward = PoswiseFeedForward(config)
         self.Yp_layer_norm = nn.LayerNorm(config.d_model)
         self.Yx_layer_norm = nn.LayerNorm(config.d_model)
+        
+        self.feed_forward = PoswiseFeedForward(config)
         self.feed_forward_layer_norm = nn.LayerNorm(config.d_model)
 
 
@@ -364,21 +364,22 @@ class LunaCausalAttention(nn.Module):
 
         self.d_model = config.d_model
         self.num_att_heads = config.num_att_heads= config.num_att_heads
+        assert self.d_model % self.num_att_heads == 0
         self.d_head = int(self.d_model / self.num_att_heads)
-        self.scale = self.d_head ** 0.5
+        self.scale = self.d_head ** -0.5
 
         self.query_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        
-        self.p_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.pq_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
         self.pc_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
 
+        if config.tie_key_value is True:
+            self.key_value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        else:
+            self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.key_value_proj = None
+        
         self.out_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-
-
-        self.pack_attention = MultiHeadAttention(config)
-        self.unpack_attention = MultiHeadAttention(config)
 
     def forward(
             self,
@@ -395,8 +396,9 @@ class LunaCausalAttention(nn.Module):
 
         p_len = p.shape[0]
 
-        pq = self.p_proj(p).view(p_len, batch_size, self.num_att_heads, self.d_head)
+        pq = self.pq_proj(p).view(p_len, batch_size, self.num_att_heads, self.d_head)
         pq = pq.permute(1, 2, 0, 3)
+        pq = pq * self.scale
 
         p_context = self.pc_proj(query)
         p_context = p_context.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
@@ -409,12 +411,16 @@ class LunaCausalAttention(nn.Module):
 
         q = self.query_proj(query)
         q = q.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+        q = q * self.scale
 
-        k = self.key_proj(query)
-        k = k.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+        if self.key_value_proj is None:
+            k = self.key_proj(query)
+            k = k.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
 
-        v = self.value_proj(query)
-        v = v.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+            v = self.value_proj(query)
+            v = v.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+        else:
+            k = v = self.key_value_proj(query).view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
     
         attn_weights = efficient_causal_attention_seq(q, k, pattn_weights)
 

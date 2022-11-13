@@ -249,7 +249,7 @@ class Luna_TransformerDecoder(nn.Module):
 
         self.layers = nn.ModuleList([LunaTransformerDecoderLayer(config) for _ in range(config.num_dec_layers)])
 
-        self.fc = nn.Linear(config.d_model, config.vocab_size)
+        self.fc = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
     def decoder_step(self,
                      dec_inputs,
@@ -407,7 +407,6 @@ class LunaCausalAttention(nn.Module):
 
         pattn_weights = p_context.bmm(pq)
         pattn_weights = nn.functional.softplus(pattn_weights, beta=math.log(2.0))
-        # 드랍아웃?
 
         q = self.query_proj(query)
         q = q.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
@@ -433,7 +432,6 @@ class LunaCausalAttention(nn.Module):
 
         attn_probs_float = nn.functional.softmax(attn_weights, dim=-1)
         attn_probs = attn_probs_float.type_as(attn_weights)
-        # 드랍아웃
 
         attn = efficient_causal_attention_seq(attn_probs, pattn_weights, v)
 

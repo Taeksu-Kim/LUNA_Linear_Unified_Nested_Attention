@@ -38,7 +38,7 @@ class PoswiseFeedForward(nn.Module):
     def forward(self, inputs):
         return self.feed_forward(inputs)
 
-def efficient_causal_attention_seq(x, y, z):
+def efficient_causal_attention_parallel(x, y, z):
     """
     efficient causal attention operation
     Args:
@@ -47,20 +47,16 @@ def efficient_causal_attention_seq(x, y, z):
         z (Tensor): Tensor with shape '(batch, n, d2)`
     return:
     """
-    n = x.size(1)
-    rets = []
-    accum_mat = 0
-    for i in range(n):
-        xx = x[:, i:i + 1] # B x 1 x d1
-        yy = y[:, i:i + 1] # B x 1 x d1
-        zz = z[:, i:i + 1] # B x 1 x d2
-
-        # B x d1 x d2
-        accum_mat = accum_mat + torch.bmm(yy.transpose(1, 2), zz)
-        # B x 1 x d2
-        rets.append(torch.bmm(xx, accum_mat).div(i + 1.))
-    # B x N x d2
-    return torch.cat(rets, dim=1)
+    bsz, n, d1 = x.size()
+    # (bsz, n, d1, 1) x (bsz, n, 1, d2) -> (bsz, n, d1, d2)
+    sum_mat = torch.matmul(y.unsqueeze(3), z.unsqueeze(2))
+    accum_mat = torch.cumsum(sum_mat, dim=1)
+    # (bsz, n, 1, d1) x (bsz, n, d1, d2) -> (bsz, n, 1, d2) -> (bsz, n, d2)
+    res = torch.matmul(x.unsqueeze(2), accum_mat).squeeze(2)
+    # (1, n, 1)
+    length_div = torch.arange(1, n + 1, device=x.device).unsqueeze(0).unsqueeze(2)
+    res = res / length_div
+    return res
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
@@ -421,7 +417,7 @@ class LunaCausalAttention(nn.Module):
         else:
             k = v = self.key_value_proj(query).view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
     
-        attn_weights = efficient_causal_attention_seq(q, k, pattn_weights)
+        attn_weights = efficient_causal_attention_parallel(q, k, pattn_weights)
 
         assert list(attn_weights.size()) == [batch_size * self.num_att_heads, dec_input_len, p_len]
 
@@ -433,7 +429,7 @@ class LunaCausalAttention(nn.Module):
         attn_probs_float = nn.functional.softmax(attn_weights, dim=-1)
         attn_probs = attn_probs_float.type_as(attn_weights)
 
-        attn = efficient_causal_attention_seq(attn_probs, pattn_weights, v)
+        attn = efficient_causal_attention_parallel(attn_probs, pattn_weights, v)
 
         attn = attn.transpose(0, 1).contiguous().view(dec_input_len, batch_size, embed_dim)
         attn = self.out_proj(attn)

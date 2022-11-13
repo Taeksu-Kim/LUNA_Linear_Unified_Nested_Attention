@@ -487,4 +487,4 @@ class Luna_Transformer(nn.Module):
                                    enc_input_mask=enc_input_mask, 
                                    p_mask=enc_p_mask)
 
-        return dec_outputs
+        return (dec_outputs,)

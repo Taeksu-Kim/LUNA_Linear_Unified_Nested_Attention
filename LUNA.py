@@ -1,11 +1,7 @@
-import random 
 import math
-import numpy as np
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch import Tensor
 import torch.nn.functional as F
 
 def PositionalEncoding(max_seq_len, d_model):
@@ -38,25 +34,26 @@ class PoswiseFeedForward(nn.Module):
     def forward(self, inputs):
         return self.feed_forward(inputs)
 
-def efficient_causal_attention_parallel(x, y, z):
-    """
-    efficient causal attention operation
-    Args:
-        x (Tensor): Tensor with shape `(batch, n, d1)`
-        y (Tensor): Tensor with shape `(batch, n, d1)`
-        z (Tensor): Tensor with shape '(batch, n, d2)`
-    return:
-    """
-    bsz, n, d1 = x.size()
-    # (bsz, n, d1, 1) x (bsz, n, 1, d2) -> (bsz, n, d1, d2)
-    sum_mat = torch.matmul(y.unsqueeze(3), z.unsqueeze(2))
-    accum_mat = torch.cumsum(sum_mat, dim=1)
-    # (bsz, n, 1, d1) x (bsz, n, d1, d2) -> (bsz, n, 1, d2) -> (bsz, n, d2)
-    res = torch.matmul(x.unsqueeze(2), accum_mat).squeeze(2)
-    # (1, n, 1)
-    length_div = torch.arange(1, n + 1, device=x.device).unsqueeze(0).unsqueeze(2)
-    res = res / length_div
-    return res
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self, config, d_head):
+        super(ScaledDotProductAttention, self).__init__()
+        self.config = config
+        self.scale = d_head ** -0.5
+        
+
+    def forward(self, query, key, value, attn_mask=None):
+      
+        query = query * self.scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) # [bs, num_heads, query_len, key_len]
+        
+        if attn_mask is not None:
+          scores.masked_fill_(attn_mask, -1e4)
+        
+        attn_prob = nn.Softmax(dim=-1)(scores)
+        # attn_prob = nn.Dropout(self.config.drop_out_raito)(attn_prob)
+        context = torch.matmul(attn_prob, value) # [bs, num_heads, query_len, d_head]
+                                                  
+        return context, attn_prob
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
@@ -99,28 +96,6 @@ class MultiHeadAttention(nn.Module):
         
         return context, attn_prob
 
-class ScaledDotProductAttention(nn.Module):
-    def __init__(self, config, d_head):
-        super(ScaledDotProductAttention, self).__init__()
-        self.config = config
-        self.scale = d_head ** -0.5
-        
-
-    def forward(self, query, key, value, attn_mask=None):
-      
-        query = query * self.scale
-        scores = torch.matmul(query, key.transpose(-2, -1)) # [bs, num_heads, query_len, key_len]
-        
-        if attn_mask is not None:
-          scores.masked_fill_(attn_mask, -1e4)
-        
-        attn_prob = nn.Softmax(dim=-1)(scores)
-        # 성능 관련 실험 필요. 허깅페이스에서는 dropout 사용함
-        # attn_prob = nn.Dropout(self.config.drop_out_raito)(attn_prob)
-        context = torch.matmul(attn_prob, value) # [bs, num_heads, query_len, d_head]
-                                                  
-        return context, attn_prob
-
 class LinearUnifiedNestedAttention(nn.Module):
     def __init__(self, config):
         super(LinearUnifiedNestedAttention, self).__init__()
@@ -137,13 +112,13 @@ class LinearUnifiedNestedAttention(nn.Module):
 
     def forward(
             self,
-            query: torch.FloatTensor,
-            key: torch.FloatTensor,
-            value: torch.FloatTensor,
-            p: torch.FloatTensor,
-            input_mask: torch.BoolTensor = None,
-            p_mask : torch.BoolTensor = None,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+            query,
+            key,
+            value,
+            p,
+            input_mask = None,
+            p_mask = None,
+    ):
         Yp, _ = self.pack_attention(query=p, 
                                     key=key, 
                                     value=value, 
@@ -226,6 +201,148 @@ class Luna_TransformerEncoder(nn.Module):
                                                 p_mask=p_mask)
         
         return outputs, projected_embedded, input_mask, p_mask
+
+def efficient_causal_attention_parallel(x, y, z):
+    """
+    efficient causal attention operation
+    Args:
+        x (Tensor): Tensor with shape `(batch, n, d1)`
+        y (Tensor): Tensor with shape `(batch, n, d1)`
+        z (Tensor): Tensor with shape '(batch, n, d2)`
+    return:
+    """
+    bsz, n, d1 = x.size()
+    # (bsz, n, d1, 1) x (bsz, n, 1, d2) -> (bsz, n, d1, d2)
+    sum_mat = torch.matmul(y.unsqueeze(3), z.unsqueeze(2))
+    accum_mat = torch.cumsum(sum_mat, dim=1)
+    # (bsz, n, 1, d1) x (bsz, n, d1, d2) -> (bsz, n, 1, d2) -> (bsz, n, d2)
+    res = torch.matmul(x.unsqueeze(2), accum_mat).squeeze(2)
+    # (1, n, 1)
+    length_div = torch.arange(1, n + 1, device=x.device).unsqueeze(0).unsqueeze(2)
+    res = res / length_div
+    return res
+
+class LunaCausalAttention(nn.Module):
+    def __init__(self, config):
+        super(LunaCausalAttention, self).__init__()
+
+        self.d_model = config.d_model
+        self.num_att_heads = config.num_att_heads= config.num_att_heads
+        assert self.d_model % self.num_att_heads == 0
+        self.d_head = int(self.d_model / self.num_att_heads)
+        self.scale = self.d_head ** -0.5
+
+        self.query_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.pq_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        self.pc_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+
+        if config.tie_key_value is True:
+            self.key_value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+        else:
+            self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+            self.key_value_proj = None
+        
+        self.out_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
+
+    def forward(
+            self,
+            query,
+            p,
+            dec_input_mask,
+            p_mask,
+    ):
+
+        query = query.transpose(0,1).contiguous()
+        p = p.transpose(0,1).contiguous()
+
+        dec_input_len, batch_size, embed_dim = query.size()
+
+        p_len = p.shape[0]
+
+        pq = self.pq_proj(p).view(p_len, batch_size, self.num_att_heads, self.d_head)
+        pq = pq.permute(1, 2, 0, 3)
+        pq = pq * self.scale
+
+        p_context = self.pc_proj(query)
+        p_context = p_context.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+
+        pq = pq.view(batch_size * self.num_att_heads, -1, self.d_head).transpose(1, 2)
+
+        pattn_weights = p_context.bmm(pq)
+        pattn_weights = nn.functional.softplus(pattn_weights, beta=math.log(2.0))
+
+        q = self.query_proj(query)
+        q = q.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+        q = q * self.scale
+
+        if self.key_value_proj is None:
+            k = self.key_proj(query)
+            k = k.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+
+            v = self.value_proj(query)
+            v = v.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+        else:
+            k = v = self.key_value_proj(query).view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
+    
+        attn_weights = efficient_causal_attention_parallel(q, k, pattn_weights)
+
+        assert list(attn_weights.size()) == [batch_size * self.num_att_heads, dec_input_len, p_len]
+
+        if p_mask is not None:
+            attn_weights = attn_weights.view(batch_size, self.num_att_heads, dec_input_len, p_len)
+            attn_weights = attn_weights.masked_fill(p_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), 1e-9)
+            attn_weights = attn_weights.view(batch_size * self.num_att_heads, dec_input_len, p_len)
+
+        attn_probs_float = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = attn_probs_float.type_as(attn_weights)
+
+        attn = efficient_causal_attention_parallel(attn_probs, pattn_weights, v)
+
+        attn = attn.transpose(0, 1).contiguous().view(dec_input_len, batch_size, embed_dim)
+        attn = self.out_proj(attn)
+        attn = attn.transpose(0, 1)
+
+        return attn
+
+class LunaTransformerDecoderLayer(nn.Module):
+    def __init__(self, config):
+        super(LunaTransformerDecoderLayer, self).__init__()
+        
+        self.luna_dec_self_attention = LunaCausalAttention(config)
+        self.cross_attention = LinearUnifiedNestedAttention(config)
+        
+        self.Yp_layer_norm = nn.LayerNorm(config.d_model)
+        self.Yx_layer_norm = nn.LayerNorm(config.d_model)
+        
+        self.feed_forward = PoswiseFeedForward(config)
+        self.feed_forward_layer_norm = nn.LayerNorm(config.d_model)
+
+
+    def forward(self,
+                dec_outputs, 
+                p,
+                enc_outputs, 
+                dec_input_mask, 
+                p_mask,
+                enc_input_mask,
+                ):
+
+        self_att_outputs  = self.luna_dec_self_attention(dec_outputs,
+                                                         p,
+                                                         dec_input_mask,
+                                                         p_mask)
+        
+        dec_outputs = self_att_outputs + dec_outputs
+
+        Yp, Yx   = self.cross_attention(dec_outputs, enc_outputs, enc_outputs, p, enc_input_mask, p_mask)
+
+        Yp = self.Yp_layer_norm(Yp + p)
+        Yx = self.Yx_layer_norm(Yx + dec_outputs)
+        outputs = self.feed_forward(Yx)
+        outputs = self.feed_forward_layer_norm(outputs + Yx)
+                                      
+        return outputs, Yp
 
 class Luna_TransformerDecoder(nn.Module):
     def __init__(self, config):
@@ -314,128 +431,6 @@ class Luna_TransformerDecoder(nn.Module):
 
 
         return dec_outputs
-
-class LunaTransformerDecoderLayer(nn.Module):
-    def __init__(self, config):
-        super(LunaTransformerDecoderLayer, self).__init__()
-        
-        self.luna_dec_self_attention = LunaCausalAttention(config)
-        self.cross_attention = LinearUnifiedNestedAttention(config)
-        
-        self.Yp_layer_norm = nn.LayerNorm(config.d_model)
-        self.Yx_layer_norm = nn.LayerNorm(config.d_model)
-        
-        self.feed_forward = PoswiseFeedForward(config)
-        self.feed_forward_layer_norm = nn.LayerNorm(config.d_model)
-
-
-    def forward(self,
-                dec_outputs, 
-                p,
-                enc_outputs, 
-                dec_input_mask, 
-                p_mask,
-                enc_input_mask,
-                ):
-
-        self_att_outputs  = self.luna_dec_self_attention(dec_outputs,
-                                                         p,
-                                                         dec_input_mask,
-                                                         p_mask)
-        
-        dec_outputs = self_att_outputs + dec_outputs
-
-        Yp, Yx   = self.cross_attention(dec_outputs, enc_outputs, enc_outputs, p, enc_input_mask, p_mask)
-
-        Yp = self.Yp_layer_norm(Yp + p)
-        Yx = self.Yx_layer_norm(Yx + dec_outputs)
-        outputs = self.feed_forward(Yx)
-        outputs = self.feed_forward_layer_norm(outputs + Yx)
-                                      
-        return outputs, Yp
-
-class LunaCausalAttention(nn.Module):
-    def __init__(self, config):
-        super(LunaCausalAttention, self).__init__()
-
-        self.d_model = config.d_model
-        self.num_att_heads = config.num_att_heads= config.num_att_heads
-        assert self.d_model % self.num_att_heads == 0
-        self.d_head = int(self.d_model / self.num_att_heads)
-        self.scale = self.d_head ** -0.5
-
-        self.query_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.pq_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        self.pc_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-
-        if config.tie_key_value is True:
-            self.key_value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-        else:
-            self.key_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-            self.value_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-            self.key_value_proj = None
-        
-        self.out_proj = nn.Linear(self.d_model, self.num_att_heads * self.d_head)
-
-    def forward(
-            self,
-            query,
-            p,
-            dec_input_mask,
-            p_mask,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-
-        query = query.transpose(0,1).contiguous()
-        p = p.transpose(0,1).contiguous()
-
-        dec_input_len, batch_size, embed_dim = query.size()
-
-        p_len = p.shape[0]
-
-        pq = self.pq_proj(p).view(p_len, batch_size, self.num_att_heads, self.d_head)
-        pq = pq.permute(1, 2, 0, 3)
-        pq = pq * self.scale
-
-        p_context = self.pc_proj(query)
-        p_context = p_context.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
-
-        pq = pq.view(batch_size * self.num_att_heads, -1, self.d_head).transpose(1, 2)
-
-        pattn_weights = p_context.bmm(pq)
-        pattn_weights = nn.functional.softplus(pattn_weights, beta=math.log(2.0))
-
-        q = self.query_proj(query)
-        q = q.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
-        q = q * self.scale
-
-        if self.key_value_proj is None:
-            k = self.key_proj(query)
-            k = k.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
-
-            v = self.value_proj(query)
-            v = v.view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
-        else:
-            k = v = self.key_value_proj(query).view(dec_input_len, batch_size * self.num_att_heads, self.d_head).transpose(0, 1)
-    
-        attn_weights = efficient_causal_attention_parallel(q, k, pattn_weights)
-
-        assert list(attn_weights.size()) == [batch_size * self.num_att_heads, dec_input_len, p_len]
-
-        if p_mask is not None:
-            attn_weights = attn_weights.view(batch_size, self.num_att_heads, dec_input_len, p_len)
-            attn_weights = attn_weights.masked_fill(p_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), 1e-9)
-            attn_weights = attn_weights.view(batch_size * self.num_att_heads, dec_input_len, p_len)
-
-        attn_probs_float = nn.functional.softmax(attn_weights, dim=-1)
-        attn_probs = attn_probs_float.type_as(attn_weights)
-
-        attn = efficient_causal_attention_parallel(attn_probs, pattn_weights, v)
-
-        attn = attn.transpose(0, 1).contiguous().view(dec_input_len, batch_size, embed_dim)
-        attn = self.out_proj(attn)
-        attn = attn.transpose(0, 1)
-
-        return attn
     
 class Luna_Transformer(nn.Module):
     def __init__(self, config):

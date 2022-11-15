@@ -17,6 +17,12 @@ https://arxiv.org/pdf/2106.01540v2.pdf
 고정된 길이를 갖는 p를 이용하여 제곱 연산을 피한다. 기존의 Multi-head attention을 pack, unpack attention으로 나눠서 수행한다.
 이때 p는 nn.Parameter로 만든 [p 길이, 임베딩 차원]의 크기의 텐서이다.
 
+## 바닐라 트랜스포머와 다른점
+- Multi-head Attention Low rank p를 이용하여 pack, unpack 2개의 Attention으로 분리
+- sacled dot attention의 스케일이 바닐라에서는 d_head ** 0.5였지만 fairseq에서는 d_head ** -0.5를 사용
+- sacled dot attention에서 바닐라 트랜스포머에서는 query, key를 matmul한 후 scale로 나눠주지만 fairseq에서는 query에만 scale을 곱해주고 다른 곳에서는 사용하지 않음
+
+
 ## 실험 결과
 
 전체적으로 한번 하는 연산을 나눠서 수행하고 거기에 학습 가능한 파라미터들이 추가되기 때문에 파라미터수는 증가한다.
